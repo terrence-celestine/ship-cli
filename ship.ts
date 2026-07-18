@@ -5,6 +5,10 @@ import chalk from "chalk"
 import { notify } from "./notify.js"
 import { Deployment, getSimulatedDeployments } from "./api.js"
 
+const MS_PER_MIN = 60_000;
+const MS_PER_HR = 60 * MS_PER_MIN;
+const MS_PER_DAY = 24 * MS_PER_HR;
+
 const program = new Command()
 
 program
@@ -24,8 +28,16 @@ program
     await runWatchLoop(intervalSec, options.simulate ?? false)
   })
 
+const formatDuration = (ms: number): string => {
+  if (ms < 1000) return "< 1s"
+  if (ms < MS_PER_MIN) return `${Math.round(ms / 1000)}s`; // time is less than 1 min
+  if (ms < MS_PER_HR) return `${Math.round(ms / MS_PER_MIN)} min`; // time is less than 1 hour
+  if (ms < MS_PER_DAY) return `${Math.round(ms / MS_PER_HR)} hr`; // time is less than a full day
+  return `${Math.round(ms / MS_PER_DAY)} days` // time is in days
+}
+
 async function runWatchLoop(intervalSec: number, simulate: boolean): Promise<void> {
-  console.log(chalk.bold(`👀 Watcing Vercel Deployments`))
+  console.log(chalk.bold(`👀 Watching Vercel Deployments`))
   console.log(chalk.dim(`   Polling every ${intervalSec}s · Ctrl+C to stop`))
   console.log()
 
@@ -62,17 +74,23 @@ async function runWatchLoop(intervalSec: number, simulate: boolean): Promise<voi
       for (const d of deployments) {
         const previous = lastStates.get(d.uid); // look up the deployment by the UID
         if (previous !== undefined && previous !== d.readyState) {
+          let message = `${previous} -> ${d.readyState}`
+          // state change has occurred
+          if (d.readyState === "READY" && d.buildingAt && d.ready) {
+            const duration = d.ready - d.buildingAt;
+            message += `(${formatDuration(duration)})`
+          }
+
           // we found the deployment but the ready states dont match, a change occured
           console.log(
             chalk.dim(`[${timestamp}]`),
             chalk.yellow("change"),
-            `${d.name} : ${previous} → ${d.readyState}`
+            `${d.name} : ${message}`
           )
           const sound = d.readyState === "ERROR" ? "Basso" : "Glass";
-
-          notify(`State changed in ${d.name}`, `${previous} => ${d.readyState}`, sound)
+          notify(`State changed in ${d.name}`, message, sound)
         } else {
-          // no changes do nothing
+          // no changes
         }
         lastStates.set(d.uid, d.readyState); // set the deployment by UID
       }
