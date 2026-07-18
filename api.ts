@@ -21,7 +21,7 @@ const SIMULATED_TRANSITIONS: Deployment[][] = [
   ],
   // Poll 2: fitlog starts building
   [
-    { uid: "dpl_sim_1", name: "fitlog", url: "sim", readyState: "BUILDING", created: Date.now(), projectId: "prj_1" },
+    { uid: "dpl_sim_1", name: "fitlog", url: "sim", readyState: "BUILDING", created: Date.now(), projectId: "prj_1", buildingAt: Date.now() - 3000 },
     { uid: "dpl_sim_2", name: "splittab", url: "sim", readyState: "READY", created: Date.now(), projectId: "prj_2" },
     { uid: "dpl_sim_3", name: "cartly", url: "sim", readyState: "READY", created: Date.now(), projectId: "prj_3" },
   ],
@@ -38,7 +38,7 @@ const SIMULATED_TRANSITIONS: Deployment[][] = [
   [
     { uid: "dpl_sim_1", name: "fitlog", url: "sim", readyState: "READY", created: Date.now(), projectId: "prj_1" },
     { uid: "dpl_sim_2", name: "splittab", url: "sim", readyState: "READY", created: Date.now(), projectId: "prj_2" },
-    { uid: "dpl_sim_3", name: "cartly", url: "sim", readyState: "ERROR", created: Date.now(), projectId: "prj_3" },
+    { uid: "dpl_sim_3", name: "cartly", url: "sim", readyState: "ERROR", created: Date.now(), projectId: "prj_3", buildingAt: Date.now() - 12_000, ready: Date.now() },
   ],
 ]
 

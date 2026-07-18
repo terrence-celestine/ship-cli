@@ -16,7 +16,7 @@ program
   .description("Watch for vercel deployment changes and notify on change")
   .version("0.1.0")
   .option("-i, --interval <seconds>", "polling interval in seconds", "60")
-  .option("--simulate", "use fake weather data that cycles through conditions")
+  .option("-s, --simulate", "use fake deployment data to cycle through deployment states")
   .action(async (options: { interval: string; simulate?: boolean }) => {
     const intervalSec = Number(options.interval)
 
@@ -76,9 +76,9 @@ async function runWatchLoop(intervalSec: number, simulate: boolean): Promise<voi
         if (previous !== undefined && previous !== d.readyState) {
           let message = `${previous} -> ${d.readyState}`
           // state change has occurred
-          if (d.readyState === "READY" && d.buildingAt && d.ready) {
+          if ((d.readyState === "READY" || d.readyState === "ERROR") && d.buildingAt && d.ready) {
             const duration = d.ready - d.buildingAt;
-            message += `(${formatDuration(duration)})`
+            message += ` (${formatDuration(duration)})`
           }
 
           // we found the deployment but the ready states dont match, a change occured
