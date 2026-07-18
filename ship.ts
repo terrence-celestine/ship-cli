@@ -17,7 +17,8 @@ program
   .version("0.1.0")
   .option("-i, --interval <seconds>", "polling interval in seconds", "60")
   .option("-s, --simulate", "use fake deployment data to cycle through deployment states")
-  .action(async (options: { interval: string; simulate?: boolean }) => {
+  .option("-f, --filter <project>", "option to watch a single project")
+  .action(async (options: { interval: string; simulate?: boolean, filter?: string }) => {
     const intervalSec = Number(options.interval)
 
     if (Number.isNaN(intervalSec) || intervalSec < 5) {
@@ -25,7 +26,7 @@ program
       process.exit(1)
     }
 
-    await runWatchLoop(intervalSec, options.simulate ?? false)
+    await runWatchLoop(intervalSec, options.simulate ?? false, options.filter)
   })
 
 const formatDuration = (ms: number): string => {
@@ -36,7 +37,7 @@ const formatDuration = (ms: number): string => {
   return `${Math.round(ms / MS_PER_DAY)} days` // time is in days
 }
 
-async function runWatchLoop(intervalSec: number, simulate: boolean): Promise<void> {
+async function runWatchLoop(intervalSec: number, simulate: boolean, filter?: string): Promise<void> {
   console.log(chalk.bold(`👀 Watching Vercel Deployments`))
   console.log(chalk.dim(`   Polling every ${intervalSec}s · Ctrl+C to stop`))
   console.log()
@@ -66,9 +67,18 @@ async function runWatchLoop(intervalSec: number, simulate: boolean): Promise<voi
         const data = await res.json() as { deployments: Deployment[] }
         deployments = data.deployments
       }
+
+      if (filter) {
+        deployments = deployments.filter(d => d.name === filter);
+      }
+
+      if (pollCount === 1 && deployments.length === 0) {
+        console.log(chalk.dim(`No deployments found matching "${filter}" — will keep watching`))
+      }
+
       if (pollCount === 1) {
         const projectCount = new Set(deployments.map(d => d.projectId)).size
-        console.log(chalk.dim(`[${timestamp}]`), chalk.cyan("watching"), `${deployments.length} deployments across ${projectCount} projects`)
+        console.log(chalk.dim(`[${timestamp}]`), chalk.cyan("watching"), `${deployments.length} ${deployments.length === 1 ? "deployment" : "deployments"} across ${projectCount} ${projectCount === 1 ? "project" : "projects"}`)
       }
 
       for (const d of deployments) {
