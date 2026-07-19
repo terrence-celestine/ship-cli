@@ -1,10 +1,15 @@
 #!/usr/bin/env -S npx tsx
 
+import { pathToFileURL } from "node:url"
 import { Command } from "commander"
 import chalk from "chalk"
 import { notify, NotificationSound } from "./notify.js"
 import { Deployment, ReadyState, getSimulatedDeployments, isTerminalState } from "./api.js"
 import { createStatusLine } from "./status.js"
+import {
+  buildDeploymentsUrl, fetchAllProjects, matchProjects, resolveLimit, scopeFrom,
+  DEFAULT_LIMIT, MAX_LIMIT, MAX_PROJECT_IDS, type Scope,
+} from "./scope.js"
 
 const MS_PER_MIN = 60_000;
 const MS_PER_HR = 60 * MS_PER_MIN;
@@ -17,7 +22,7 @@ const MAX_TRACKED_FAILURES = 20 // keeps 2 ** n away from Infinity
 /** A rejected token never self-heals, so these are fatal rather than retried. */
 class AuthError extends Error { }
 
-interface ProjectStats {
+export interface ProjectStats {
   name: string
   transitions: number
   successes: number
@@ -25,7 +30,7 @@ interface ProjectStats {
   durations: number[] // ms, only recorded when the API gave us both timestamps
 }
 
-interface SessionStats {
+export interface SessionStats {
   startedAt: number
   polls: number
   errors: number
@@ -41,8 +46,12 @@ interface WatchOptions {
   intervalSec: number
   simulate: boolean
   notifyMode: NotifyMode
+  limit: number
+  scope: Scope
   token?: string
   filters?: string[]
+  /** Resolved at startup; absent means "no server-side project narrowing". */
+  projectIds?: string[]
 }
 
 const program = new Command()
@@ -55,7 +64,9 @@ program
   .option("-s, --simulate", "use fake deployment data to cycle through deployment states")
   .option("-f, --filter <projects>", "watch only these projects (comma-separated, case-insensitive substring match)")
   .option("-n, --notify <mode>", `when to send macOS notifications: ${NOTIFY_MODES.join(" | ")}`, "terminal")
-  .action(async (options: { interval: string; simulate?: boolean, filter?: string, notify: string }) => {
+  .option("-l, --limit <n>", `how many recent deployments to watch (1-${MAX_LIMIT}, default ${DEFAULT_LIMIT})`)
+  .option("-t, --team <slug>", "watch a Vercel team's deployments (accepts a team slug or team_ id)")
+  .action(async (options: { interval: string; simulate?: boolean, filter?: string, notify: string, limit?: string, team?: string }) => {
     const intervalSec = Number(options.interval)
 
     if (Number.isNaN(intervalSec) || intervalSec < 5) {
@@ -90,13 +101,67 @@ program
       process.exit(1)
     }
 
-    await runWatchLoop({ intervalSec, simulate: options.simulate ?? false, notifyMode, token, filters })
+    let explicitLimit: number | undefined
+    if (options.limit !== undefined) {
+      explicitLimit = Number(options.limit)
+      if (!Number.isInteger(explicitLimit) || explicitLimit < 1 || explicitLimit > MAX_LIMIT) {
+        console.error(chalk.red(`Limit must be a whole number between 1 and ${MAX_LIMIT}. Got: ${options.limit}`))
+        process.exit(1)
+      }
+    }
+
+    const simulate = options.simulate ?? false
+
+    // Silently dropping a scope flag is the exact bug class this release fixes,
+    // so say so rather than ignoring it quietly.
+    if (simulate) {
+      for (const [flag, value] of [["--team", options.team], ["--limit", options.limit]] as const) {
+        if (value !== undefined) console.error(chalk.dim(`⚠ ${flag} is ignored with --simulate`))
+      }
+    }
+
+    const scope = scopeFrom(simulate ? undefined : options.team)
+
+    // Resolve filters to exact project ids up front, so a quiet project isn't
+    // invisible just because busier ones fill the recent-deployments window.
+    // --simulate has no project list, so it keeps the client-side path.
+    let projectIds: string[] | undefined
+    let matchedProjectCount: number | undefined
+
+    if (!simulate && filters && token) {
+      try {
+        const { projects, truncated } = await fetchAllProjects({ token, scope })
+        if (truncated) {
+          console.error(chalk.dim(`⚠ stopped after ${projects.length} projects — filters resolved against those only`))
+        }
+
+        const { matched, unmatched } = matchProjects(projects, filters)
+        for (const f of unmatched) {
+          console.error(chalk.dim(`⚠ no project matched "${f}" — will keep watching in case it appears`))
+        }
+
+        if (matched.length > MAX_PROJECT_IDS) {
+          console.error(chalk.dim(`⚠ filters matched ${matched.length} projects — watching the most recent deployments instead`))
+        } else if (matched.length > 0) {
+          projectIds = matched.map(p => p.id)
+          matchedProjectCount = matched.length
+        }
+      } catch (err) {
+        console.error(chalk.red(err instanceof Error ? err.message : String(err)))
+        console.error(chalk.dim(`   Check VERCEL_TOKEN and --team — see "Setup" in the README.`))
+        process.exit(1)
+      }
+    }
+
+    const limit = resolveLimit({ explicit: explicitLimit, matchedProjectCount })
+
+    await runWatchLoop({ intervalSec, simulate, notifyMode, limit, scope, token, filters, projectIds })
   })
 
 // Each range is checked against the *rounded* value, not the raw ms. Checking
 // raw ms and then rounding lets the top of a range render in the next unit's
 // number while keeping this unit's label — 59_600ms would print "60s".
-const formatDuration = (ms: number): string => {
+export const formatDuration = (ms: number): string => {
   if (ms < 1000) return "< 1s"
 
   const secs = Math.round(ms / 1000)
@@ -114,20 +179,27 @@ const formatDuration = (ms: number): string => {
 
 // Keyed off the resulting state, not the notify mode: CANCELED is neither a
 // success nor a failure, which is how the summary counts it too.
-const soundFor = (state: ReadyState): NotificationSound =>
+export const soundFor = (state: ReadyState): NotificationSound =>
   state === "READY" ? "Glass" : state === "ERROR" ? "Basso" : "Pop"
 
-const average = (values: number[]): number =>
+export const backoffDelayMs = (baseDelayMs: number, consecutiveFailures: number): number =>
+  consecutiveFailures === 0
+    ? baseDelayMs
+    // The cap must never fall below the configured interval, or -i 600 would
+    // poll *more* often while failing than while healthy.
+    : Math.min(baseDelayMs * 2 ** consecutiveFailures, Math.max(MAX_BACKOFF_MS, baseDelayMs))
+
+export const average = (values: number[]): number =>
   values.reduce((sum, v) => sum + v, 0) / values.length
 
-const tally = (deployments: Deployment[]): Map<string, number> => {
+export const tally = (deployments: Deployment[]): Map<string, number> => {
   const counts = new Map<string, number>()
   for (const d of deployments) counts.set(d.readyState, (counts.get(d.readyState) ?? 0) + 1)
   return counts
 }
 
 /** Pure so it stays easy to eyeball — returns lines, prints nothing. */
-const renderSummary = (session: SessionStats, now: number): string[] => {
+export const renderSummary = (session: SessionStats, now: number): string[] => {
   const lines: string[] = []
   const polls = `${session.polls} ${session.polls === 1 ? "poll" : "polls"}`
   const errors = session.errors > 0
@@ -181,7 +253,7 @@ const renderSummary = (session: SessionStats, now: number): string[] => {
   return lines
 }
 
-async function runWatchLoop({ intervalSec, simulate, notifyMode, token, filters }: WatchOptions): Promise<void> {
+async function runWatchLoop({ intervalSec, simulate, notifyMode, limit, scope, token, filters, projectIds }: WatchOptions): Promise<void> {
   console.log(chalk.bold(`👀 Watching Vercel Deployments`))
   console.log(chalk.dim(`   Polling every ${intervalSec}s · Ctrl+C to stop`))
   console.log()
@@ -201,15 +273,8 @@ async function runWatchLoop({ intervalSec, simulate, notifyMode, token, filters 
   let inFlight: AbortController | null = null
   let shuttingDown = false
 
-  const nextDelayMs = (): number =>
-    consecutiveFailures === 0
-      ? baseDelayMs
-      // The cap must never fall below the configured interval, or -i 600 would
-      // poll *more* often while failing than while healthy.
-      : Math.min(baseDelayMs * 2 ** consecutiveFailures, Math.max(MAX_BACKOFF_MS, baseDelayMs))
-
   const scheduleNext = (): number => {
-    const delay = nextDelayMs()
+    const delay = backoffDelayMs(baseDelayMs, consecutiveFailures)
     if (shuttingDown) return delay
     status.setNextPollAt(Date.now() + delay)
     pollTimer = setTimeout(poll, delay)
@@ -260,12 +325,18 @@ async function runWatchLoop({ intervalSec, simulate, notifyMode, token, filters 
         const controller = new AbortController()
         inFlight = controller
         try {
-          const res = await fetch("https://api.vercel.com/v6/deployments?limit=5", {
+          const res = await fetch(buildDeploymentsUrl({ limit, scope, projectIds }), {
             headers: { Authorization: `Bearer ${token}` },
             signal: AbortSignal.any([controller.signal, AbortSignal.timeout(timeoutMs)]),
           })
-          if (res.status === 401 || res.status === 403) {
-            throw new AuthError(`Vercel API: ${res.status} — token rejected or lacks access to this scope`)
+          if (res.status === 401) {
+            // Scope is irrelevant to an invalid token — don't muddy it with team advice.
+            throw new AuthError(`Vercel API: 401 — token is invalid or expired`)
+          }
+          if (res.status === 403) {
+            throw new AuthError(scope.teamValue
+              ? `Vercel API: 403 — token rejected, or it lacks access to team "${scope.teamValue}"`
+              : `Vercel API: 403 — token rejected or lacks access to this scope`)
           }
           if (!res.ok) throw new Error(`Vercel API: ${res.status}`)
           const data = await res.json() as { deployments: Deployment[] }
@@ -297,6 +368,11 @@ async function runWatchLoop({ intervalSec, simulate, notifyMode, token, filters 
           }
         } else if (deployments.length === 0) {
           status.log(chalk.dim(`   No deployments found — will keep watching`))
+          // An unscoped token returns 200 [] for a team's projects, so no error
+          // path ever fires. Without this hint the tool just looks broken.
+          if (!simulate && !scope.teamValue) {
+            status.log(chalk.dim(`   If your projects belong to a Vercel team, pass --team <slug>`))
+          }
         }
       }
 
@@ -389,4 +465,8 @@ async function runWatchLoop({ intervalSec, simulate, notifyMode, token, filters 
   await poll()
 }
 
-program.parse()
+// Only parse argv when run as the entry point. Tests import this module for the
+// pure helpers above, and a bare parse() would start a real poll loop.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  program.parse()
+}

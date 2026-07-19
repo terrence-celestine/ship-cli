@@ -21,7 +21,7 @@ export interface NotifyOptions {
  * or the backslash this adds to `\"` gets doubled in turn and breaks the
  * literal. Newlines must be converted AFTER, so their backslash isn't doubled.
  */
-const escape = (value: string): string =>
+export const escapeAppleScript = (value: string): string =>
   value
     // Control characters with no AppleScript escape. \n and \r survive for the
     // last step; a stray \x1b would otherwise mean raw ANSI in the banner.
@@ -30,8 +30,16 @@ const escape = (value: string): string =>
     .replace(/"/g, '\\"')
     .replace(/\r\n|\r|\n/g, "\\n")
 
+/**
+ * Assemble the AppleScript. Separate from `notify` so it can be tested without
+ * spawning anything — the security property is a property of this string, not
+ * of the escaper alone.
+ */
+export const buildNotificationScript = ({ title, message, sound }: Omit<NotifyOptions, "onError">): string =>
+  `display notification "${escapeAppleScript(message)}" with title "${escapeAppleScript(title)}" sound name "${sound}"`
+
 export function notify({ title, message, sound, onError }: NotifyOptions): void {
-  const script = `display notification "${escape(message)}" with title "${escape(title)}" sound name "${sound}"`
+  const script = buildNotificationScript({ title, message, sound })
 
   // execFile, not exec: arguments go straight to the process with no /bin/sh in
   // between, so shell metacharacters in a project name can't be interpreted.

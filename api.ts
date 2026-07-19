@@ -1,3 +1,9 @@
+// Kept as constants so the eventual /v6 -> /v7 bump is a one-token change,
+// verified on its own rather than bundled with a behavior change.
+export const VERCEL_API_BASE = "https://api.vercel.com"
+export const DEPLOYMENTS_PATH = "/v6/deployments"
+export const PROJECTS_PATH = "/v10/projects"
+
 export type ReadyState = "READY" | "BUILDING" | "ERROR" | "QUEUED" | "CANCELED" | "INITIALIZING" | (string & {})
 
 export interface Deployment {
