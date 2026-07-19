@@ -2,8 +2,8 @@
 
 import { Command } from "commander"
 import chalk from "chalk"
-import { notify } from "./notify.js"
-import { Deployment, getSimulatedDeployments } from "./api.js"
+import { notify, NotificationSound } from "./notify.js"
+import { Deployment, ReadyState, getSimulatedDeployments, isTerminalState } from "./api.js"
 import { createStatusLine } from "./status.js"
 
 const MS_PER_MIN = 60_000;
@@ -32,9 +32,15 @@ interface SessionStats {
   projects: Map<string, ProjectStats> // keyed by projectId, the stable identifier
 }
 
+/** Which transitions earn a macOS banner. Never gates the log line. */
+type NotifyMode = "terminal" | "all" | "none"
+
+const NOTIFY_MODES: NotifyMode[] = ["terminal", "all", "none"]
+
 interface WatchOptions {
   intervalSec: number
   simulate: boolean
+  notifyMode: NotifyMode
   token?: string
   filters?: string[]
 }
@@ -48,7 +54,8 @@ program
   .option("-i, --interval <seconds>", "polling interval in seconds", "60")
   .option("-s, --simulate", "use fake deployment data to cycle through deployment states")
   .option("-f, --filter <projects>", "watch only these projects (comma-separated, case-insensitive substring match)")
-  .action(async (options: { interval: string; simulate?: boolean, filter?: string }) => {
+  .option("-n, --notify <mode>", `when to send macOS notifications: ${NOTIFY_MODES.join(" | ")}`, "terminal")
+  .action(async (options: { interval: string; simulate?: boolean, filter?: string, notify: string }) => {
     const intervalSec = Number(options.interval)
 
     if (Number.isNaN(intervalSec) || intervalSec < 5) {
@@ -66,6 +73,12 @@ program
       }
     }
 
+    const notifyMode = options.notify as NotifyMode
+    if (!NOTIFY_MODES.includes(notifyMode)) {
+      console.error(chalk.red(`Notify mode must be one of: ${NOTIFY_MODES.join(", ")}. Got: ${options.notify}`))
+      process.exit(1)
+    }
+
     // Trimmed, so an empty or whitespace-only export reads as missing rather
     // than 403-ing on every tick forever. --simulate never needs a token.
     const token = process.env.VERCEL_TOKEN?.trim()
@@ -77,16 +90,32 @@ program
       process.exit(1)
     }
 
-    await runWatchLoop({ intervalSec, simulate: options.simulate ?? false, token, filters })
+    await runWatchLoop({ intervalSec, simulate: options.simulate ?? false, notifyMode, token, filters })
   })
 
+// Each range is checked against the *rounded* value, not the raw ms. Checking
+// raw ms and then rounding lets the top of a range render in the next unit's
+// number while keeping this unit's label — 59_600ms would print "60s".
 const formatDuration = (ms: number): string => {
   if (ms < 1000) return "< 1s"
-  if (ms < MS_PER_MIN) return `${Math.round(ms / 1000)}s`; // time is less than 1 min
-  if (ms < MS_PER_HR) return `${Math.round(ms / MS_PER_MIN)} min`; // time is less than 1 hour
-  if (ms < MS_PER_DAY) return `${Math.round(ms / MS_PER_HR)} hr`; // time is less than a full day
-  return `${Math.round(ms / MS_PER_DAY)} days` // time is in days
+
+  const secs = Math.round(ms / 1000)
+  if (secs < 60) return `${secs}s`
+
+  const mins = Math.round(ms / MS_PER_MIN)
+  if (mins < 60) return `${mins} min`
+
+  const hrs = Math.round(ms / MS_PER_HR)
+  if (hrs < 24) return `${hrs} hr`
+
+  const days = Math.round(ms / MS_PER_DAY)
+  return `${days} ${days === 1 ? "day" : "days"}`
 }
+
+// Keyed off the resulting state, not the notify mode: CANCELED is neither a
+// success nor a failure, which is how the summary counts it too.
+const soundFor = (state: ReadyState): NotificationSound =>
+  state === "READY" ? "Glass" : state === "ERROR" ? "Basso" : "Pop"
 
 const average = (values: number[]): number =>
   values.reduce((sum, v) => sum + v, 0) / values.length
@@ -152,7 +181,7 @@ const renderSummary = (session: SessionStats, now: number): string[] => {
   return lines
 }
 
-async function runWatchLoop({ intervalSec, simulate, token, filters }: WatchOptions): Promise<void> {
+async function runWatchLoop({ intervalSec, simulate, notifyMode, token, filters }: WatchOptions): Promise<void> {
   console.log(chalk.bold(`👀 Watching Vercel Deployments`))
   console.log(chalk.dim(`   Polling every ${intervalSec}s · Ctrl+C to stop`))
   console.log()
@@ -292,13 +321,35 @@ async function runWatchLoop({ intervalSec, simulate, token, filters }: WatchOpti
           else if (d.readyState === "ERROR") stats.failures += 1
           if (duration !== undefined) stats.durations.push(duration)
 
+          // Only on terminal states: mid-flight the host isn't serving this
+          // build yet, so the link would be noise on the least useful lines.
+          // Vercel returns a bare hostname, and terminals only linkify with a
+          // scheme. Plain text rather than an OSC 8 hyperlink, so redirected
+          // output stays free of escape sequences.
+          const terminal = isTerminalState(d.readyState)
+          const link = terminal && d.url ? `https://${d.url}` : ""
+
+          // Logged in every notify mode — the scrollback is the record; it's
+          // the banner and the sound that were the interruption.
           status.log(
             chalk.dim(`[${timestamp}]`),
             chalk.yellow("change"),
-            `${d.name} : ${message}`
+            `${d.name} : ${message}`,
+            ...(link ? [chalk.dim(link)] : []),
           )
-          const sound = d.readyState === "ERROR" ? "Basso" : "Glass";
-          notify(`State changed in ${d.name}`, message, sound)
+
+          const shouldNotify = notifyMode === "all" || (notifyMode === "terminal" && terminal)
+          if (shouldNotify) {
+            notify({
+              title: `State changed in ${d.name}`,
+              message: link ? `${message}\n${link}` : message,
+              sound: soundFor(d.readyState),
+              // Guarded: after shutdown() the status line is stopped, and a late
+              // status.log would redraw one under the finished summary with no
+              // ticker left to clear it.
+              onError: (m) => { if (!shuttingDown) status.log(chalk.dim(`   notification failed: ${m}`)) },
+            })
+          }
         }
         lastStates.set(d.uid, d.readyState); // set the deployment by UID
       }
